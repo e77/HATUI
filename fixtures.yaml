@@ -1,0 +1,5 @@
+scenarios:
+  ups_alarm:
+    sensor.smartups_status: "On Battery, Battery Discharging"
+  clear_alarm:
+    sensor.smartups_status: "Online"

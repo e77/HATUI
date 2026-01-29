@@ -1,0 +1,83 @@
+layout:
+  columns: 3
+
+defaults:
+  color_normal: "#ffb000"
+  color_normal_dim: "#b89550"
+  color_on: "#468a00"
+  color_on_bright: "#88ff55"
+  color_warn_a: "red"
+  color_warn_b: "white"
+  color_arrow: "#ffdd55"
+  poll_seconds: 2
+  trend_minutes: 120
+  daily_avg: true
+  history_refresh_seconds: 60
+
+# If UPS enters an "on battery" state, the whole title bar flashes red/white
+ups_alarm:
+  entity: sensor.smartups_status
+  alarm_contains:
+    - "on battery"
+    - "discharging"
+
+header:
+  title: "HA STATUS BOARD"
+  right:
+    - id: sensor.smartups_status
+      label: "UPS"
+      format: "{state}"
+    - id: sensor.ups_runtime_minutes
+      label: "RT"
+      format: "{state}m"
+
+footer:
+  right:
+    - id: sensor.eero_wan_status
+      label: "WAN"
+      format: "{state}"
+    - id: sensor.eero_external_ip
+      label: "IP"
+      format: "{state}"
+
+# LEFT PANEL: climate grouped by floor. Add heat_entity per room to color row green when heating.
+climate:
+  title: "CLIMATE"
+  unit_fallback: "C"
+  floors:
+    - name: "First Floor"
+      rooms:
+        - name: "Desk"
+          id: sensor.desk_temperature
+          heat_entity: "sensor.office_trv_hvac_action"
+          set_entity: "climate.office_trv_thermostat"
+        - name: "Bedroom"
+          id: sensor.bedside_temperature
+          heat_entity: "sensor.bedroom_trv_hvac_action"
+          set_entity: "climate.bedroom_trv_thermostat"
+
+    - name: "Ground Floor"
+      rooms:
+        - name: "Bathroom"
+          id: sensor.bathroom_temperature
+          heat_entity: sensor.bathroom_trv_hvac_action
+          set_entity: "climate.bathroom_trv_thermostat"
+        - name: "Kitchen"
+          id: sensor.kitchen_temperature
+          heat_entity: ""   # fill later
+        - name: "Dining"
+          id: sensor.ewelink_snzb_02p_temperature
+          heat_entity: "sensor.dining_room_trv_hvac_action"
+          set_entity: "climate.dining_room_trv_thermostat"
+        - name: "Living"
+          id: sensor.living_room_temperature
+          heat_entity: "sensor.sonoff_trvzb_hvac_action"
+          set_entity: "climate.sonoff_trvzb_thermostat"
+
+# Boiler status moved into the top of the left climate panel.
+middle:
+  boiler_entity: switch.boiler
+  boiler_on_state: "on"
+
+right_panel:
+  title: "ENERGY"
