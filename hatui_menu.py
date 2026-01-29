@@ -21,6 +21,7 @@ import yaml
 
 CTL_PATH = os.getenv("HATUI_CTL", "/run/hatui/ctl")
 FIXTURE_PATH = os.getenv("HATUI_FIXTURE", "fixtures.yaml").strip()
+HATUI_SERVICE = os.getenv("HATUI_SERVICE", "hatui.service").strip()
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -78,10 +79,25 @@ def git_check_updates() -> List[str]:
     return files
 
 
-def git_apply_updates() -> None:
+def git_apply_updates() -> bool:
     print("\n[pulling updates]")
     res = run(["git", "pull", "--ff-only"])
     print(res.stdout or res.stderr)
+    return res.returncode == 0
+
+
+def restart_service() -> bool:
+    if not HATUI_SERVICE:
+        print("No service configured to restart.")
+        return False
+    print(f"\n[restarting service] {HATUI_SERVICE}")
+    res = run(["systemctl", "restart", HATUI_SERVICE])
+    print(res.stdout or res.stderr)
+    if res.returncode != 0:
+        print("Service restart failed.")
+        return False
+    print("Service restarted.")
+    return True
 
 
 def ota_update_yaml_py() -> None:
@@ -95,7 +111,8 @@ def ota_update_yaml_py() -> None:
         print(f" - {f}")
     choice = input("Apply updates? (y/N): ").strip().lower()
     if choice == "y":
-        git_apply_updates()
+        if git_apply_updates():
+            restart_service()
     else:
         print("Skipped.")
 

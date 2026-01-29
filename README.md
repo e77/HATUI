@@ -29,6 +29,8 @@ WantedBy=multi-user.target
 
 The menu writes commands to the control FIFO (`$HATUI_CTL`, default `/run/hatui/ctl`) and supports
 fast-forward `git pull` updates for YAML/PY files.
+After applying updates, it restarts the systemd service named by `HATUI_SERVICE` (default:
+`hatui.service`).
 
 ### Git integration setup (required for “Check for updates”)
 Before using the menu’s “Check for updates” or applying OTA updates, configure the repo’s git
