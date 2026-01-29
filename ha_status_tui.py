@@ -481,7 +481,7 @@ class HatuiApp(App):
 
         self.set_interval(self.poll_seconds, self.poll_fast)
         self.set_interval(0.2, self.heartbeat)
-        self.set_interval(0.6, self.toggle_flash_and_pulse)
+        self.set_interval(0.5, self.toggle_flash_and_pulse)
         self.set_interval(self.history_refresh_seconds, self.poll_history)
 
         await self.poll_fast()
@@ -904,7 +904,11 @@ class HatuiApp(App):
             header.append(self.boiler_bar)
             header.append("\n")
         header.append("BOILER:", style=self.color_normal)
-        header.append("ON" if boiler_on else "OFF", style=(self.color_on_bright if boiler_on else self.color_normal))
+        if boiler_on:
+            boiler_style = self.color_on_bright if self._pulse else self.color_on
+        else:
+            boiler_style = self.color_normal
+        header.append("ON" if boiler_on else "OFF", style=boiler_style)
         header.append("\n\n")
 
         unit_default = str(self.cfg["climate"].get("unit_fallback", "C")).strip()
@@ -962,7 +966,7 @@ class HatuiApp(App):
 
                 if heating:
                     room_style = self.color_on_bright if self._pulse else self.color_on
-                    now_style = self.color_on_bright
+                    now_style = room_style
                 else:
                     room_style = self.color_normal
                     now_style = self.color_normal
