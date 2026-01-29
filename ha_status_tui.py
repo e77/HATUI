@@ -562,6 +562,10 @@ class HatuiApp(App):
 
     def apply_command(self, cmd: str) -> None:
         c = cmd.strip()
+        for keyword in ("set", "clear", "flash", "scenario"):
+            if c.lower().startswith(f"{keyword}:"):
+                c = f"{keyword} {c[len(keyword) + 1:]}"
+                break
 
         if c.lower().startswith("set "):
             rest = c[4:].strip()
