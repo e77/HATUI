@@ -29,8 +29,16 @@ WantedBy=multi-user.target
 
 The menu writes commands to the control FIFO (`$HATUI_CTL`, default `/run/hatui/ctl`) and supports
 fast-forward `git pull` updates for YAML/PY files.
-After applying updates, it restarts the systemd service named by `HATUI_SERVICE` (default:
-`hatui.service`).
+After applying updates, it restarts `hatui-wayland.service` when available; otherwise it restarts
+`hatui.service` (the default `HATUI_SERVICE`).
+Restarting from the menu requires passwordless sudo for `systemctl restart`. Add a sudoers rule
+for the SSH user (example for `echo77it`) so the non-interactive restart can run:
+
+```
+echo77it ALL=NOPASSWD: /bin/systemctl restart hatui.service
+```
+
+If you run the Wayland unit, swap the unit name to `hatui-wayland.service`.
 
 ### Git integration setup (required for “Check for updates”)
 Before using the menu’s “Check for updates” or applying OTA updates, configure the repo’s git
