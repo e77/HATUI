@@ -24,6 +24,7 @@ FIXTURE_PATH = os.getenv("HATUI_FIXTURE", "fixtures.yaml").strip()
 HATUI_SERVICE = os.getenv("HATUI_SERVICE", "hatui.service").strip()
 WAYLAND_SERVICE = "hatui-wayland.service"
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+INSTALL_SCRIPT = os.path.join(REPO_ROOT, "scripts", "install_deps.sh")
 
 
 def read_yaml(path: str) -> Dict[str, object]:
@@ -119,6 +120,16 @@ def restart_service() -> bool:
     return True
 
 
+def install_dependencies() -> bool:
+    if not os.path.exists(INSTALL_SCRIPT):
+        print(f"Dependency install script not found: {INSTALL_SCRIPT}")
+        return False
+    print("\n[installing dependencies]")
+    res = run([INSTALL_SCRIPT])
+    print(res.stdout or res.stderr)
+    return res.returncode == 0
+
+
 def ota_update_yaml_py() -> None:
     files = git_check_updates()
     targets = [f for f in files if f.endswith((".yaml", ".yml", ".py"))]
@@ -131,6 +142,7 @@ def ota_update_yaml_py() -> None:
     choice = input("Apply updates? (y/N): ").strip().lower()
     if choice == "y":
         if git_apply_updates():
+            install_dependencies()
             restart_service()
     else:
         print("Skipped.")
