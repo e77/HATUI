@@ -447,6 +447,11 @@ class HatuiApp(App):
         self.entity_states: Dict[str, EntityState] = {}
         self.climate_avg: Dict[str, Optional[float]] = {}
         self.boiler_bar: Optional[Text] = None
+        self.boiler_bar_fracs: Optional[List[float]] = None
+        self.boiler_bar_label: Optional[str] = None
+        self.boiler_bar_tick: Optional[str] = None
+        self.boiler_last_on_end: Optional[datetime] = None
+        self.boiler_on_live: bool = False
 
         self.runtime_overrides: Dict[str, EntityState] = {}
         self.flash_mode = "auto"  # auto|on|off
@@ -481,7 +486,7 @@ class HatuiApp(App):
 
         self.set_interval(self.poll_seconds, self.poll_fast)
         self.set_interval(0.2, self.heartbeat)
-        self.set_interval(0.6, self.toggle_flash_and_pulse)
+        self.set_interval(1.0, self.toggle_flash_and_pulse)
         self.set_interval(self.history_refresh_seconds, self.poll_history)
 
         await self.poll_fast()
@@ -497,6 +502,7 @@ class HatuiApp(App):
     def toggle_flash_and_pulse(self) -> None:
         self._flash = not self._flash
         self._pulse = not self._pulse
+        self.render_panels()
 
     def play_alarm_sound(self) -> None:
         if not self.enable_alarm_sound:
@@ -709,6 +715,11 @@ class HatuiApp(App):
             for eid, st in self.runtime_overrides.items():
                 self.entity_states[eid] = st
 
+            if boiler_id:
+                boiler_on_state = str(mid_cfg.get("boiler_on_state", "on")).strip().lower()
+                boiler_state_live = (self.entity_states.get(boiler_id).state if self.entity_states.get(boiler_id) else "").strip().lower()
+                self.boiler_on_live = (boiler_state_live == boiler_on_state)
+
             ua = self.cfg.get("ups_alarm", {}) or {}
             ups_id = str(ua.get("entity", "sensor.smartups_status")).strip()
             ups_state = (self.entity_states.get(ups_id).state if self.entity_states.get(ups_id) else "").lower()
@@ -748,12 +759,7 @@ class HatuiApp(App):
                 # Current boiler state (from live entity state) drives the final-block "now" behavior
                 boiler_state_live = (self.entity_states.get(boiler_id).state if self.entity_states.get(boiler_id) else "").strip().lower()
                 boiler_on_live = (boiler_state_live == boiler_on_state)
-
-                # How recently was it ON?
-                if last_on_end is None:
-                    age_sec = 10**9
-                else:
-                    age_sec = (now - last_on_end).total_seconds()
+                self.boiler_on_live = boiler_on_live
 
                 # Build axis labels (start/mid/end) with NO trailing spaces (use placeholder dots)
                 now_local = datetime.now().astimezone()
@@ -782,63 +788,18 @@ class HatuiApp(App):
                     tick[p] = "│"
                 tick_line = "".join(tick)
 
-                # Period coloring rules:
-                # - off whole period => normal_dim
-                # - on part => normal
-                # - on whole => on
-                full_thr = 0.98
-                part_thr = 0.02
-
-                # Final (most recent) period special behavior:
-                # - if ON now => on_bright blinking
-                # - else if ON within last 5m => on
-                # - else if ON within last 15m => normal
-                # - else => normal_dim
-                bar = Text()
-                bar.append(Text(label_line, style=self.color_normal_dim, no_wrap=True, overflow="crop"))
-                bar.append("\n")
-                bar.append(Text(tick_line, style=self.color_normal_dim, no_wrap=True, overflow="crop"))
-                bar.append("\n")
-
-                                # --- Density glyph mapping (no gaps) ---
-                for i, frac in enumerate(fracs):
-                    # Base style (keep your colour rules)
-                    if frac >= full_thr:
-                        st = self.color_on
-                        ch = "█"
-                    elif frac > part_thr:
-                        st = self.color_normal
-                        # 0..1 mapped to density
-                        if frac < 0.50:
-                            ch = "▒"
-                        else:
-                            ch = "░"
-                    else:
-                        st = self.color_normal_dim
-                        ch = "░"
-
-                    # Final (most recent) period special behaviour
-                    if i == (len(fracs) - 1):
-                        if boiler_on_live:
-                            st = self.color_on_bright if self._pulse else self.color_on
-                            ch = "█"
-                        else:
-                            if age_sec <= 300:
-                                st = self.color_on
-                                ch = "█"
-                            elif age_sec <= 900:
-                                st = self.color_normal
-                                ch = "░"
-                            else:
-                                st = self.color_normal_dim
-                                ch = "░"
-
-                    bar.append(ch, style=st)
-
-                self.boiler_bar = bar
+                self.boiler_bar_fracs = fracs
+                self.boiler_bar_label = label_line
+                self.boiler_bar_tick = tick_line
+                self.boiler_last_on_end = last_on_end
+                self.boiler_bar = None
 
             else:
                 self.boiler_bar = None
+                self.boiler_bar_fracs = None
+                self.boiler_bar_label = None
+                self.boiler_bar_tick = None
+                self.boiler_last_on_end = None
 
 
             if self.daily_avg:
@@ -900,11 +861,16 @@ class HatuiApp(App):
         boiler_on = (boiler_state == boiler_on_state)
 
         header = Text()
-        if self.boiler_bar is not None:
-            header.append(self.boiler_bar)
+        boiler_bar = self.build_boiler_bar()
+        if boiler_bar is not None:
+            header.append(boiler_bar)
             header.append("\n")
         header.append("BOILER:", style=self.color_normal)
-        header.append("ON" if boiler_on else "OFF", style=(self.color_on_bright if boiler_on else self.color_normal))
+        if boiler_on:
+            boiler_style = self.color_on_bright if self._pulse else self.color_on
+        else:
+            boiler_style = self.color_normal
+        header.append("ON" if boiler_on else "OFF", style=boiler_style)
         header.append("\n\n")
 
         unit_default = str(self.cfg["climate"].get("unit_fallback", "C")).strip()
@@ -962,7 +928,7 @@ class HatuiApp(App):
 
                 if heating:
                     room_style = self.color_on_bright if self._pulse else self.color_on
-                    now_style = self.color_on_bright
+                    now_style = room_style
                 else:
                     room_style = self.color_normal
                     now_style = self.color_normal
@@ -987,6 +953,72 @@ class HatuiApp(App):
         outer.add_row(header)
         outer.add_row(tbl)
         return outer
+
+    def build_boiler_bar(self) -> Optional[Text]:
+        if not self.boiler_bar_fracs or not self.boiler_bar_label or not self.boiler_bar_tick:
+            return None
+
+        # Period coloring rules:
+        # - off whole period => normal_dim
+        # - on part => normal
+        # - on whole => on
+        full_thr = 0.98
+        part_thr = 0.02
+
+        # How recently was it ON?
+        now = datetime.now(timezone.utc)
+        if self.boiler_last_on_end is None:
+            age_sec = 10**9
+        else:
+            age_sec = (now - self.boiler_last_on_end).total_seconds()
+
+        # Final (most recent) period special behavior:
+        # - if ON now => on_bright blinking
+        # - else if ON within last 5m => on
+        # - else if ON within last 15m => normal
+        # - else => normal_dim
+        bar = Text()
+        bar.append(Text(self.boiler_bar_label, style=self.color_normal_dim, no_wrap=True, overflow="crop"))
+        bar.append("\n")
+        bar.append(Text(self.boiler_bar_tick, style=self.color_normal_dim, no_wrap=True, overflow="crop"))
+        bar.append("\n")
+
+        # --- Density glyph mapping (no gaps) ---
+        for i, frac in enumerate(self.boiler_bar_fracs):
+            # Base style (keep your colour rules)
+            if frac >= full_thr:
+                st = self.color_on
+                ch = "█"
+            elif frac > part_thr:
+                st = self.color_normal
+                # 0..1 mapped to density
+                if frac < 0.50:
+                    ch = "▒"
+                else:
+                    ch = "░"
+            else:
+                st = self.color_normal_dim
+                ch = "░"
+
+            # Final (most recent) period special behaviour
+            if i == (len(self.boiler_bar_fracs) - 1):
+                if self.boiler_on_live:
+                    st = self.color_on_bright if self._pulse else self.color_on
+                    ch = "█"
+                else:
+                    if age_sec <= 300:
+                        st = self.color_on
+                        ch = "█"
+                    elif age_sec <= 900:
+                        st = self.color_normal
+                        ch = "░"
+                    else:
+                        st = self.color_normal_dim
+                        ch = "░"
+
+            bar.append(ch, style=st)
+
+        return bar
 
 
 def main() -> int:
