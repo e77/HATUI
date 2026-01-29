@@ -46,7 +46,8 @@ WantedBy=multi-user.target
 ```
 
 The menu writes commands to the control FIFO (`$HATUI_CTL`, default `/run/hatui/ctl`) and supports
-fast-forward `git pull` updates for YAML/PY files.
+firmware-style updates for YAML/PY files by force-syncing the local checkout to `origin/master`.
+This update path discards local changes (`git reset --hard` + `git clean -fd`).
 After applying updates, it restarts `hatui-wayland.service` when available; otherwise it restarts
 `hatui.service` (the default `HATUI_SERVICE`).
 Restarting from the menu requires passwordless sudo for `systemctl restart`. Add a sudoers rule
@@ -60,15 +61,14 @@ If you run the Wayland unit, swap the unit name to `hatui-wayland.service`.
 
 ### Git integration setup (required for “Check for updates”)
 Before using the menu’s “Check for updates” or applying OTA updates, configure the repo’s git
-remote and upstream tracking. Run the setup script once on the device:
+remote. Run the setup script once on the device:
 
 ```
 ./scripts/setup_git_integration.sh
 ```
 
 By default, the script reads `HATUI_GIT_REMOTE` or `config/hatui_git.json` (key `remote_url`) to
-set/update the `origin` remote, ensures the current branch tracks `origin/<branch>`, and adds the
-repo to `safe.directory` when needed (root or non-owner).
+set/update the `origin` remote and adds the repo to `safe.directory` when needed (root or non-owner).
 
 ## Config includes (panel-specific YAML)
 You can split configuration into panel-specific YAML files and merge them at runtime using
