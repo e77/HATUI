@@ -30,6 +30,25 @@ CTL_PATH = os.getenv("HATUI_CTL", "/run/hatui/ctl")
 FIXTURE_PATH = os.getenv("HATUI_FIXTURE", "fixtures.yaml").strip()
 
 
+def read_yaml(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        log(f"YAML read error for {path}: {e}")
+        return {}
+
+
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, val in (override or {}).items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], val)
+        else:
+            out[key] = val
+    return out
+
+
 def log(msg: str) -> None:
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -275,8 +294,21 @@ class FixtureEngine:
 
 
 def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = read_yaml(path)
+
+    includes = cfg.get("includes", {}) or {}
+    for section, inc_path in includes.items():
+        inc_path = str(inc_path or "").strip()
+        if not inc_path:
+            continue
+        block = read_yaml(inc_path)
+        if section == "all":
+            cfg = deep_merge(cfg, block)
+            continue
+        existing = cfg.get(section, {})
+        if not isinstance(existing, dict):
+            existing = {}
+        cfg[section] = deep_merge(existing, block)
 
     cfg.setdefault("layout", {})
     cfg.setdefault("defaults", {})
