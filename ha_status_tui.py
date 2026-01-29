@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import asyncio
 import os
 import re
+import shutil
 import stat
-import asyncio
-import threading
 import subprocess
+import sys
+import threading
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import yaml
-from rich.text import Text
-from rich.table import Table
 
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal
-from textual.widgets import Static
+# Do not introduce Textual or other UI frameworks.
 
 __version__ = "9.6.6-fix2"
 __build__ = "2026-01-28"
@@ -29,6 +27,13 @@ SPINNER_FRAMES = ["|", "/", "-", "\\"]
 LOG_PATH = os.getenv("HATUI_LOG", "/tmp/hatui.log")
 CTL_PATH = os.getenv("HATUI_CTL", "/run/hatui/ctl")
 FIXTURE_PATH = os.getenv("HATUI_FIXTURE", "fixtures.yaml").strip()
+
+ANSI_RESET = "\x1b[0m"
+ANSI_BOLD = "\x1b[1m"
+ANSI_HIDE_CURSOR = "\x1b[?25l"
+ANSI_SHOW_CURSOR = "\x1b[?25h"
+ANSI_CLEAR = "\x1b[2J\x1b[H"
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def read_yaml(path: str) -> Dict[str, Any]:
@@ -319,12 +324,144 @@ def compute_period_fractions(
     return fractions, last_on_end, current_on
 
 
-class Panel(Static):
-    def __init__(self, panel_id: str):
-        super().__init__("", id=panel_id)
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
 
-    def set_renderable(self, r) -> None:
-        self.update(r)
+
+def visible_len(text: str) -> int:
+    return len(strip_ansi(text))
+
+
+def crop_ansi(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if visible_len(text) <= width:
+        return text
+    out = []
+    count = 0
+    i = 0
+    while i < len(text) and count < width:
+        if text[i] == "\x1b":
+            m = ANSI_RE.match(text, i)
+            if m:
+                out.append(m.group(0))
+                i = m.end()
+                continue
+        out.append(text[i])
+        count += 1
+        i += 1
+    out.append(ANSI_RESET)
+    return "".join(out)
+
+
+def pad_ansi(text: str, width: int, align: str = "left") -> str:
+    text = crop_ansi(text, width)
+    length = visible_len(text)
+    if length >= width:
+        return text
+    pad = width - length
+    if align == "right":
+        return (" " * pad) + text
+    if align == "center":
+        left = pad // 2
+        right = pad - left
+        return (" " * left) + text + (" " * right)
+    return text + (" " * pad)
+
+
+def parse_hex_color(color: str) -> Optional[Tuple[int, int, int]]:
+    color = color.strip()
+    if not color.startswith("#"):
+        return None
+    hexval = color[1:]
+    if len(hexval) == 3:
+        hexval = "".join([c * 2 for c in hexval])
+    if len(hexval) != 6:
+        return None
+    try:
+        r = int(hexval[0:2], 16)
+        g = int(hexval[2:4], 16)
+        b = int(hexval[4:6], 16)
+    except ValueError:
+        return None
+    return r, g, b
+
+
+def color_to_ansi(color: str, background: bool = False) -> str:
+    if not color:
+        return ""
+    color = color.strip()
+    if color.startswith("color(") and color.endswith(")"):
+        try:
+            idx = int(color[6:-1])
+            return f"\x1b[{48 if background else 38};5;{idx}m"
+        except ValueError:
+            return ""
+    rgb = parse_hex_color(color)
+    if rgb:
+        r, g, b = rgb
+        return f"\x1b[{48 if background else 38};2;{r};{g};{b}m"
+    named = {
+        "black": (0, 0, 0),
+        "white": (255, 255, 255),
+        "red": (220, 50, 47),
+        "green": (133, 153, 0),
+        "yellow": (181, 137, 0),
+        "blue": (38, 139, 210),
+        "magenta": (211, 54, 130),
+        "cyan": (42, 161, 152),
+        "gray": (128, 128, 128),
+        "grey": (128, 128, 128),
+    }
+    rgb = named.get(color.lower())
+    if rgb:
+        r, g, b = rgb
+        return f"\x1b[{48 if background else 38};2;{r};{g};{b}m"
+    return ""
+
+
+def style_text(text: str, fg: str = "", bg: str = "", bold: bool = False) -> str:
+    parts = []
+    fg_code = color_to_ansi(fg, background=False) if fg else ""
+    bg_code = color_to_ansi(bg, background=True) if bg else ""
+    if bold:
+        parts.append(ANSI_BOLD)
+    if fg_code:
+        parts.append(fg_code)
+    if bg_code:
+        parts.append(bg_code)
+    if parts:
+        return "".join(parts) + text + ANSI_RESET
+    return text
+
+
+def join_lr(left: str, right: str, width: int) -> str:
+    left = left or ""
+    right = right or ""
+    total = visible_len(left) + visible_len(right)
+    if total + 1 > width:
+        if visible_len(right) >= width:
+            return crop_ansi(right, width)
+        available = max(1, width - visible_len(right) - 1)
+        left = crop_ansi(left, available)
+    space = width - visible_len(left) - visible_len(right)
+    if space < 1:
+        space = 1
+    return left + (" " * space) + right
+
+
+def apply_padding(lines: List[str], width: int, pad_v: int, pad_h: int) -> List[str]:
+    content_width = max(0, width - (pad_h * 2))
+    padded = [" " * width for _ in range(pad_v)]
+    for line in lines:
+        line = pad_ansi(line, content_width)
+        padded.append((" " * pad_h) + line + (" " * pad_h))
+    padded.extend([" " * width for _ in range(pad_v)])
+    return padded
+
+
+def clamp_width(text: str, width: int, align: str = "left") -> str:
+    return pad_ansi(text, width, align=align)
 
 
 class FixtureEngine:
@@ -419,9 +556,8 @@ def load_config(path: str) -> Dict[str, Any]:
     return cfg
 
 
-class HatuiApp(App):
+class HatuiAnsiApp:
     def __init__(self, ha_url: str, ha_token: str, cfg_path: str):
-        super().__init__()
         self.cfg = load_config(cfg_path)
 
         d = self.cfg["defaults"]
@@ -446,47 +582,14 @@ class HatuiApp(App):
 
         ui = self.cfg.get("ui", {})
         pad_v, pad_h = ui.get("panel_padding", [1, 2])
-        mx = int(ui.get("panel_margin_x", 1))
-        my = int(ui.get("screen_margin_y", 0))
-
-        self.CSS = f'''
-        Screen {{ background: black; color: {self.color_normal}; }}
-
-        #header {{
-            dock: top; height: 3;
-            border: round {self.color_border};
-            padding: 0 1;
-            margin: {my} 1 0 1;
-        }}
-
-        #footer {{
-            dock: bottom; height: 3;
-            border: round {self.color_border};
-            padding: 0 1;
-            margin: 0 1 {my} 1;
-        }}
-
-        Horizontal {{ height: 1fr; width: 100%; }}
-
-        .col {{
-            width: 1fr; height: 100%;
-            border: round {self.color_border};
-            padding: {int(pad_v)} {int(pad_h)};
-            margin: 0 {mx};
-            background: black;
-        }}
-        '''
+        self.panel_pad_v = int(pad_v)
+        self.panel_pad_h = int(pad_h)
+        self.panel_margin_x = int(ui.get("panel_margin_x", 1))
+        self.screen_margin_y = int(ui.get("screen_margin_y", 0))
 
         self.ha = HAClient(ha_url, ha_token)
 
-        self.header = Static("", id="header")
-        self.footer = Static("", id="footer")
-        self.left_panel = Panel("left_panel")
-        self.mid_panel = Panel("mid_panel")
-        self.right_panel = Panel("right_panel")
-
         self.columns = max(1, int(self.cfg["layout"].get("columns", 3)))
-        self._col_widgets: List[Static] = []
 
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -494,13 +597,13 @@ class HatuiApp(App):
         self._flash = False
         self._pulse = False
         self._alarm_prev_should_flash = False
+        self._should_flash = False
 
         self.last_ok: Optional[datetime] = None
         self.last_err: Optional[str] = None
 
         self.entity_states: Dict[str, EntityState] = {}
         self.climate_avg: Dict[str, Optional[float]] = {}
-        self.boiler_bar: Optional[Text] = None
         self.boiler_bar_fracs: Optional[List[float]] = None
         self.boiler_bar_label: Optional[str] = None
         self.boiler_bar_tick: Optional[str] = None
@@ -517,47 +620,61 @@ class HatuiApp(App):
 
         self._ctl_queue: "asyncio.Queue[str]" = asyncio.Queue()
         self.ups_alarm = False
+        self._stop = asyncio.Event()
 
-    def compose(self) -> ComposeResult:
-        yield self.header
-        with Horizontal():
-            for i in range(self.columns):
-                yield Static("", classes="col", id=f"col{i+1}")
-        yield self.footer
-
-    async def on_mount(self) -> None:
-        self._col_widgets = [self.query_one(f"#col{i+1}", Static) for i in range(self.columns)]
-        if self.columns >= 1:
-            self._col_widgets[0].mount(self.left_panel)
-        if self.columns >= 2:
-            self._col_widgets[1].mount(self.mid_panel)
-        if self.columns >= 3:
-            self._col_widgets[2].mount(self.right_panel)
-
+    async def run(self) -> None:
         self._session = aiohttp.ClientSession()
-
+        sys.stdout.write(ANSI_HIDE_CURSOR)
+        sys.stdout.flush()
         self.start_control_pipe()
-        asyncio.create_task(self.control_consumer())
-
-        self.set_interval(self.poll_seconds, self.poll_fast)
-        self.set_interval(0.2, self.heartbeat)
-        self.set_interval(1.0, self.toggle_flash_and_pulse)
-        self.set_interval(self.history_refresh_seconds, self.poll_history)
-
-        await self.poll_fast()
-        await self.poll_history()
-
-    async def on_unmount(self) -> None:
+        tasks = [
+            asyncio.create_task(self.control_consumer()),
+            asyncio.create_task(self.poll_fast_loop()),
+            asyncio.create_task(self.poll_history_loop()),
+            asyncio.create_task(self.heartbeat_loop()),
+            asyncio.create_task(self.flash_loop()),
+            asyncio.create_task(self.render_loop()),
+        ]
         try:
+            await asyncio.gather(*tasks)
+        finally:
+            self._stop.set()
+            for task in tasks:
+                task.cancel()
             if self._session:
                 await self._session.close()
-        except Exception:
-            pass
+            sys.stdout.write(ANSI_SHOW_CURSOR)
+            sys.stdout.write(ANSI_RESET)
+            sys.stdout.flush()
+
+    async def poll_fast_loop(self) -> None:
+        while not self._stop.is_set():
+            await self.poll_fast()
+            await asyncio.sleep(self.poll_seconds)
+
+    async def poll_history_loop(self) -> None:
+        while not self._stop.is_set():
+            await self.poll_history()
+            await asyncio.sleep(self.history_refresh_seconds)
+
+    async def heartbeat_loop(self) -> None:
+        while not self._stop.is_set():
+            self.heartbeat()
+            await asyncio.sleep(0.2)
+
+    async def flash_loop(self) -> None:
+        while not self._stop.is_set():
+            self.toggle_flash_and_pulse()
+            await asyncio.sleep(1.0)
+
+    async def render_loop(self) -> None:
+        while not self._stop.is_set():
+            self.render_screen()
+            await asyncio.sleep(0.2)
 
     def toggle_flash_and_pulse(self) -> None:
         self._flash = not self._flash
         self._pulse = not self._pulse
-        self.render_panels()
 
     def play_alarm_sound(self) -> None:
         if not self.enable_alarm_sound:
@@ -607,13 +724,12 @@ class HatuiApp(App):
             log(f"Failed to start control pipe: {e}")
 
     async def control_consumer(self) -> None:
-        while True:
+        while not self._stop.is_set():
             cmd = await self._ctl_queue.get()
             try:
                 self.apply_command(cmd)
             except Exception as e:
                 log(f"Bad command '{cmd}': {e}")
-            self.render_panels()
 
     def apply_command(self, cmd: str) -> None:
         c = cmd.strip()
@@ -737,53 +853,15 @@ class HatuiApp(App):
                     entity_windows[entity] = window_hours
         return entity_windows
 
-    def grid_lr(self, left: str, right: str):
-        tbl = Table.grid(expand=True)
-        tbl.add_column(ratio=3, justify="left", overflow="crop")
-        tbl.add_column(ratio=2, justify="right", overflow="crop")
-        tbl.add_row(left, right)
-        return tbl
-
     def heartbeat(self) -> None:
         self._spinner_i = (self._spinner_i + 1) % len(SPINNER_FRAMES)
-        spin = SPINNER_FRAMES[self._spinner_i]
-        now_local = datetime.now().strftime("%a %d-%b-%Y %H:%M:%S")
-
-        title = str(self.cfg["header"].get("title", "HA STATUS BOARD"))
-        left = f"MODE:LIVE v{__version__}  {title}  {spin}  {now_local}"
-        right = self.format_items(self.cfg["header"].get("right", []))
-        self.header.update(self.grid_lr(left, right))
-
-        conn = "OK" if self.last_ok else "-"
-        if self.last_err:
-            conn = "ERROR"
-        if self.last_ok:
-            age = int((datetime.now(timezone.utc) - self.last_ok).total_seconds())
-            ok_text = f"Last OK: {age}s"
-        else:
-            ok_text = "Last OK: -"
-        err_text = (self.last_err or "-")[:70]
-        left_f = f"Conn: {conn}  {ok_text}  Err: {err_text}"
-        right_f = self.format_items(self.cfg["footer"].get("right", []))
-        self.footer.update(self.grid_lr(left_f, right_f))
-
         if self.flash_mode == "on":
             should_flash = True
         elif self.flash_mode == "off":
             should_flash = False
         else:
             should_flash = bool(self.ups_alarm or self.last_err)
-
-        if should_flash:
-            if self._flash:
-                self.header.styles.color = self.alarm_text_a
-                self.header.styles.background = self.alarm_bg_a
-            else:
-                self.header.styles.color = self.alarm_text_b
-                self.header.styles.background = self.alarm_bg_b
-        else:
-            self.header.styles.color = self.color_normal
-            self.header.styles.background = "black"
+        self._should_flash = should_flash
 
         if should_flash and not self._alarm_prev_should_flash:
             self.play_alarm_sound()
@@ -843,7 +921,6 @@ class HatuiApp(App):
 
             self.last_ok = datetime.now(timezone.utc)
             self.last_err = None
-            self.render_panels()
 
         except Exception as e:
             self.last_err = str(e)
@@ -871,12 +948,10 @@ class HatuiApp(App):
                     periods=periods,
                 )
 
-                # Current boiler state (from live entity state) drives the final-block "now" behavior
                 boiler_state_live = (self.entity_states.get(boiler_id).state if self.entity_states.get(boiler_id) else "").strip().lower()
                 boiler_on_live = (boiler_state_live == boiler_on_state)
                 self.boiler_on_live = boiler_on_live
 
-                # Build axis labels (start/mid/end) with NO trailing spaces (use placeholder dots)
                 now_local = datetime.now().astimezone()
                 end_local = now_local
                 start_local = end_local - timedelta(hours=12)
@@ -888,6 +963,7 @@ class HatuiApp(App):
 
                 width = periods
                 label = ["·"] * width
+
                 def put(pos: int, s: str) -> None:
                     pos = max(0, min(width - len(s), int(pos)))
                     for i, ch in enumerate(s):
@@ -907,15 +983,12 @@ class HatuiApp(App):
                 self.boiler_bar_label = label_line
                 self.boiler_bar_tick = tick_line
                 self.boiler_last_on_end = last_on_end
-                self.boiler_bar = None
 
             else:
-                self.boiler_bar = None
                 self.boiler_bar_fracs = None
                 self.boiler_bar_label = None
                 self.boiler_bar_tick = None
                 self.boiler_last_on_end = None
-
 
             if self.daily_avg:
                 local_now = datetime.now().astimezone()
@@ -948,29 +1021,116 @@ class HatuiApp(App):
                 except Exception as e:
                     log(f"right_panel history error for {entity_id}: {e}")
 
-            self.render_panels()
-
         except Exception as e:
             self.last_err = str(e)
             log("poll_history error: " + str(e))
             log(traceback.format_exc())
 
-    def render_panels(self) -> None:
-        self.left_panel.set_renderable(self.render_climate_panel())
-        self.mid_panel.set_renderable(self.render_middle_panel())
-        self.right_panel.set_renderable(self.render_right_panel())
+    def render_screen(self) -> None:
+        term = shutil.get_terminal_size(fallback=(120, 40))
+        width = max(40, term.columns)
+        height = max(20, term.lines)
 
-    def render_middle_panel(self):
-        t = Text()
-        t.append("STATUS\n\n", style=self.color_normal)
-        t.append("Live control FIFO:\n", style=self.color_normal_dim)
-        t.append(f"  {CTL_PATH}\n\n", style=self.color_normal_dim)
-        t.append("Examples:\n", style=self.color_normal_dim)
-        t.append("  set sensor.smartups_status=On Battery, Battery Discharging\n", style=self.color_normal_dim)
-        t.append("  clear sensor.smartups_status\n", style=self.color_normal_dim)
-        t.append("  scenario ups_alarm\n", style=self.color_normal_dim)
-        t.append("  flash auto|on|off\n", style=self.color_normal_dim)
-        return t
+        header_lines = self.render_header(width)
+        footer_lines = self.render_footer(width)
+
+        content_height = height - len(header_lines) - len(footer_lines)
+        if content_height < 1:
+            content_height = 1
+
+        panel_lines = self.render_panels(width, content_height)
+
+        lines = []
+        if self.screen_margin_y > 0:
+            lines.extend(["" for _ in range(self.screen_margin_y)])
+        lines.extend(header_lines)
+        lines.extend(panel_lines)
+        lines.extend(footer_lines)
+        if self.screen_margin_y > 0:
+            lines.extend(["" for _ in range(self.screen_margin_y)])
+
+        output = ANSI_CLEAR + "\n".join(lines[:height])
+        sys.stdout.write(output)
+        sys.stdout.flush()
+
+    def render_header(self, width: int) -> List[str]:
+        spin = SPINNER_FRAMES[self._spinner_i]
+        now_local = datetime.now().strftime("%a %d-%b-%Y %H:%M:%S")
+
+        title = str(self.cfg["header"].get("title", "HA STATUS BOARD"))
+        left = f"MODE:LIVE v{__version__}  {title}  {spin}  {now_local}"
+        right = self.format_items(self.cfg["header"].get("right", []))
+        line = join_lr(left, right, width)
+
+        if self._should_flash:
+            fg = self.alarm_text_a if self._flash else self.alarm_text_b
+            bg = self.alarm_bg_a if self._flash else self.alarm_bg_b
+            line = style_text(line, fg=fg, bg=bg, bold=True)
+        else:
+            line = style_text(line, fg=self.color_normal)
+        return [line]
+
+    def render_footer(self, width: int) -> List[str]:
+        conn = "OK" if self.last_ok else "-"
+        if self.last_err:
+            conn = "ERROR"
+        if self.last_ok:
+            age = int((datetime.now(timezone.utc) - self.last_ok).total_seconds())
+            ok_text = f"Last OK: {age}s"
+        else:
+            ok_text = "Last OK: -"
+        err_text = (self.last_err or "-")[:70]
+        left_f = f"Conn: {conn}  {ok_text}  Err: {err_text}"
+        right_f = self.format_items(self.cfg["footer"].get("right", []))
+        line = join_lr(left_f, right_f, width)
+        line = style_text(line, fg=self.color_normal_dim)
+        return [line]
+
+    def render_panels(self, width: int, height: int) -> List[str]:
+        columns = max(1, self.columns)
+        gap = max(0, self.panel_margin_x)
+        total_gap = gap * (columns - 1)
+        panel_width = max(10, (width - total_gap) // columns)
+
+        panel_sets: List[List[str]] = []
+        left = self.render_climate_panel(panel_width)
+        panel_sets.append(left)
+
+        if columns >= 2:
+            panel_sets.append(self.render_middle_panel(panel_width))
+        if columns >= 3:
+            panel_sets.append(self.render_right_panel(panel_width))
+
+        panel_sets = [apply_padding(lines, panel_width, self.panel_pad_v, self.panel_pad_h) for lines in panel_sets]
+
+        max_lines = max(len(p) for p in panel_sets) if panel_sets else 0
+        max_lines = min(max_lines, height)
+
+        lines = []
+        for i in range(max_lines):
+            row_parts = []
+            for p in panel_sets:
+                content = p[i] if i < len(p) else ""
+                row_parts.append(clamp_width(content, panel_width))
+            lines.append((" " * gap).join(row_parts))
+        if len(lines) < height:
+            lines.extend(["" for _ in range(height - len(lines))])
+        return lines
+
+    def render_middle_panel(self, width: int) -> List[str]:
+        lines = [
+            style_text("STATUS", fg=self.color_normal),
+            "",
+            style_text("Live control FIFO:", fg=self.color_normal_dim),
+            style_text(f"  {CTL_PATH}", fg=self.color_normal_dim),
+            "",
+            style_text("Examples:", fg=self.color_normal_dim),
+            style_text("  set sensor.smartups_status=On Battery, Battery Discharging", fg=self.color_normal_dim),
+            style_text("  clear sensor.smartups_status", fg=self.color_normal_dim),
+            style_text("  scenario ups_alarm", fg=self.color_normal_dim),
+            style_text("  flash auto|on|off", fg=self.color_normal_dim),
+        ]
+        return lines
 
     def get_entity_state_value(self, entity_id: str) -> Tuple[str, Optional[float], Dict[str, Any]]:
         entity_id = str(entity_id or "").strip()
@@ -1000,34 +1160,34 @@ class HatuiApp(App):
         except Exception:
             return state_str or "—"
 
-    def render_value_cell(self, cfg: Dict[str, Any]) -> Text:
+    def render_value_cell(self, cfg: Dict[str, Any]) -> str:
         label = str(cfg.get("label", "")).strip()
         entity_id = str(cfg.get("entity", "")).strip()
         fmt = str(cfg.get("fmt", "{value}"))
         state_str, value, attrs = self.get_entity_state_value(entity_id)
         value_text = self.format_entity_value(fmt, state_str, value, attrs)
-        t = Text()
+        parts = []
         if label:
-            t.append(label + " ", style=self.color_normal_dim)
-        t.append(value_text, style=self.color_normal)
-        return t
+            parts.append(style_text(label + " ", fg=self.color_normal_dim))
+        parts.append(style_text(value_text, fg=self.color_normal))
+        return "".join(parts)
 
-    def render_value_row(self, block: Dict[str, Any]):
+    def render_value_row(self, block: Dict[str, Any], width: int) -> List[str]:
         left_cfg = block.get("left", {}) or {}
         right_cfg = block.get("right", {}) or {}
-        tbl = Table.grid(expand=True, padding=(0, 0))
-        tbl.add_column(ratio=1, justify="left", overflow="crop")
-        tbl.add_column(ratio=1, justify="right", overflow="crop")
-        tbl.add_row(self.render_value_cell(left_cfg), self.render_value_cell(right_cfg))
-        return tbl
+        left_text = self.render_value_cell(left_cfg)
+        right_text = self.render_value_cell(right_cfg)
+        line = join_lr(left_text, right_text, width)
+        return [line]
 
-    def render_ranked_list(self, block: Dict[str, Any]):
+    def render_ranked_list(self, block: Dict[str, Any], width: int) -> List[str]:
         title = str(block.get("title", "")).strip()
         limit = int(block.get("limit", 5))
         value_fmt = str(block.get("value_fmt", "{value:,.0f} W"))
         thresholds = block.get("thresholds", {}) or {}
         red_thr = safe_float(thresholds.get("red"))
         yellow_thr = safe_float(thresholds.get("yellow"))
+        label_w = self.right_panel_label_width()
 
         rows: List[Tuple[str, Optional[float]]] = []
         for item in block.get("items", []) or []:
@@ -1041,14 +1201,9 @@ class HatuiApp(App):
         rows.sort(key=lambda r: (r[1] is None, -(r[1] or 0.0)))
         rows = rows[:max(0, limit)]
 
-        outer = Table.grid(expand=True)
-        outer.add_column()
+        lines: List[str] = []
         if title:
-            outer.add_row(Text(title, style=self.color_normal))
-
-        tbl = Table.grid(expand=True, padding=(0, 0))
-        tbl.add_column(width=self.right_panel_label_width(), justify="left", overflow="crop")
-        tbl.add_column(justify="right", overflow="crop")
+            lines.append(style_text(title, fg=self.color_normal))
 
         for name, value in rows:
             if value is None:
@@ -1066,15 +1221,13 @@ class HatuiApp(App):
                 else:
                     value_style = self.color_normal
 
-            tbl.add_row(
-                Text(name, style=self.color_normal),
-                Text(value_text, style=value_style),
-            )
+            left = style_text(pad_ansi(name, label_w), fg=self.color_normal)
+            right = style_text(value_text, fg=value_style)
+            line = join_lr(left, right, width)
+            lines.append(line)
+        return lines
 
-        outer.add_row(tbl)
-        return outer
-
-    def render_stacked_bar(self, block: Dict[str, Any]):
+    def render_stacked_bar(self, block: Dict[str, Any], width: int) -> List[str]:
         title = str(block.get("title", "")).strip()
         total_entity = str(block.get("total_entity", "")).strip()
         total_fmt = str(block.get("total_fmt", "{value:,.0f} W"))
@@ -1103,10 +1256,10 @@ class HatuiApp(App):
                 segments.append((str(other_cfg.get("name", "Other")), remainder, remainder))
 
         denom = max_w if max_w and max_w > 0 else (total_value or 0.0)
-        width = max(4, self.right_panel_bar_width())
+        bar_width = max(4, self.right_panel_bar_width())
         total_width = 0
         if denom > 0 and total_value:
-            total_width = min(width, int(round((total_value / denom) * width)))
+            total_width = min(bar_width, int(round((total_value / denom) * bar_width)))
         total_width = max(0, total_width)
 
         seg_widths = [0 for _ in segments]
@@ -1131,38 +1284,40 @@ class HatuiApp(App):
             self.color_warn_a,
         ]
 
-        bar = Text()
+        bar_parts: List[str] = []
         for i, width_i in enumerate(seg_widths):
             if width_i <= 0:
                 continue
             color = palette[i % len(palette)]
-            bar.append("█" * width_i, style=color)
-        if total_width < width:
-            bar.append("·" * (width - total_width), style=self.color_normal_dim)
+            bar_parts.append(style_text("█" * width_i, fg=color))
+        if total_width < bar_width:
+            bar_parts.append(style_text("·" * (bar_width - total_width), fg=self.color_normal_dim))
+        bar_line = "".join(bar_parts)
 
-        outer = Table.grid(expand=True)
-        outer.add_column()
+        lines: List[str] = []
         if title or total_entity:
             total_text = self.format_entity_value(total_fmt, total_state, total_value, total_attrs)
-            outer.add_row(self.grid_lr(title or "Distribution", total_text))
+            header_line = join_lr(
+                style_text(title or "Distribution", fg=self.color_normal),
+                style_text(total_text, fg=self.color_normal),
+                width,
+            )
+            lines.append(header_line)
 
-        outer.add_row(bar)
+        lines.append(bar_line)
 
         if block.get("show_legend", True):
-            legend = Table.grid(expand=True, padding=(0, 0))
-            legend.add_column(width=self.right_panel_label_width(), justify="left", overflow="crop")
-            legend.add_column(justify="right", overflow="crop")
+            label_w = self.right_panel_label_width()
             for i, (name, _, raw_value) in enumerate(segments):
                 color = palette[i % len(palette)]
                 if raw_value is None:
                     val_text = "—"
                 else:
                     val_text = self.format_entity_value(total_fmt, str(raw_value), raw_value, {})
-                legend.add_row(Text(name, style=color), Text(val_text, style=color))
-            if segments:
-                outer.add_row(legend)
-
-        return outer
+                left = style_text(pad_ansi(name, label_w), fg=color)
+                right = style_text(val_text, fg=color)
+                lines.append(join_lr(left, right, width))
+        return lines
 
     def compress_bool_blocks(self, blocks: List[bool], target_len: int) -> List[bool]:
         if target_len <= 0:
@@ -1180,21 +1335,17 @@ class HatuiApp(App):
             out.append(any(chunk))
         return out
 
-    def render_timeline_onoff(self, block: Dict[str, Any]):
+    def render_timeline_onoff(self, block: Dict[str, Any], width: int) -> List[str]:
         title = str(block.get("title", "")).strip()
         window_hours = float(block.get("window_hours", 24))
         resolution = int(block.get("resolution", 96))
-        width = min(resolution, self.right_panel_timeline_width())
+        bar_width = min(resolution, self.right_panel_timeline_width())
         now = datetime.now(timezone.utc)
+        label_w = self.right_panel_label_width()
 
-        outer = Table.grid(expand=True)
-        outer.add_column()
+        lines: List[str] = []
         if title:
-            outer.add_row(Text(title, style=self.color_normal))
-
-        tbl = Table.grid(expand=True, padding=(0, 0))
-        tbl.add_column(width=self.right_panel_label_width(), justify="left", overflow="crop")
-        tbl.add_column(justify="left", overflow="crop")
+            lines.append(style_text(title, fg=self.color_normal))
 
         for item in block.get("items", []) or []:
             name = str(item.get("name", "")).strip()
@@ -1203,6 +1354,7 @@ class HatuiApp(App):
             history = self.right_panel_history.get(entity, []) if entity else []
 
             if op and threshold is not None:
+
                 def predicate(state):
                     val = safe_float(state)
                     if val is None:
@@ -1220,6 +1372,7 @@ class HatuiApp(App):
                     if op == "!=":
                         return val != threshold
                     return False
+
             else:
                 on_states = item.get("on_states", ["on", "true", "home", "open"]) or []
                 on_set = set([str(s).strip().lower() for s in on_states])
@@ -1228,100 +1381,99 @@ class HatuiApp(App):
                     return str(state or "").strip().lower() in on_set
 
             blocks = build_bool_bar(history, now, window_hours, resolution, predicate)
-            blocks = self.compress_bool_blocks(blocks, width)
+            blocks = self.compress_bool_blocks(blocks, bar_width)
 
-            bar = Text()
+            bar_parts: List[str] = []
             for is_on in blocks:
                 if is_on:
-                    bar.append("█", style=self.color_on)
+                    bar_parts.append(style_text("█", fg=self.color_on))
                 else:
-                    bar.append("·", style=self.color_normal_dim)
+                    bar_parts.append(style_text("·", fg=self.color_normal_dim))
 
             if not blocks:
-                bar.append("—", style=self.color_normal_dim)
+                bar_parts.append(style_text("—", fg=self.color_normal_dim))
 
-            tbl.add_row(Text(name or entity, style=self.color_normal), bar)
+            left = style_text(pad_ansi(name or entity, label_w), fg=self.color_normal)
+            bar = "".join(bar_parts)
+            line = join_lr(left, bar, width)
+            lines.append(line)
 
-        outer.add_row(tbl)
-        return outer
+        return lines
 
-    def render_divider(self) -> Text:
+    def render_divider(self) -> str:
         width = self.right_panel_label_width() + self.right_panel_bar_width() + 3
-        return Text("─" * max(8, width), style=self.color_normal_dim)
+        return style_text("─" * max(8, width), fg=self.color_normal_dim)
 
-    def render_right_panel(self):
+    def render_right_panel(self, width: int) -> List[str]:
         rp = self.cfg.get("right_panel", {}) or {}
         title = str(rp.get("title", "ENERGY")).strip()
 
-        outer = Table.grid(expand=True)
-        outer.add_column()
-        outer.add_row(Text(title + "\n", style=self.color_normal))
+        lines = [style_text(title, fg=self.color_normal), ""]
 
         blocks = self.right_panel_blocks()
         if not blocks:
-            t = Text("No right_panel blocks configured.\n", style=self.color_normal_dim)
-            outer.add_row(t)
-            return outer
+            lines.append(style_text("No right_panel blocks configured.", fg=self.color_normal_dim))
+            return lines
 
         for block in blocks:
             btype = str(block.get("type", "")).strip().lower()
             if btype == "value_row":
-                outer.add_row(self.render_value_row(block))
+                lines.extend(self.render_value_row(block, width))
             elif btype == "ranked_list":
-                outer.add_row(self.render_ranked_list(block))
+                lines.extend(self.render_ranked_list(block, width))
             elif btype == "stacked_bar":
-                outer.add_row(self.render_stacked_bar(block))
+                lines.extend(self.render_stacked_bar(block, width))
             elif btype == "timeline_onoff":
-                outer.add_row(self.render_timeline_onoff(block))
+                lines.extend(self.render_timeline_onoff(block, width))
             elif btype == "divider":
-                outer.add_row(self.render_divider())
+                lines.append(self.render_divider())
             else:
-                outer.add_row(Text(f"Unknown block: {btype}", style=self.color_normal_dim))
-        return outer
+                lines.append(style_text(f"Unknown block: {btype}", fg=self.color_normal_dim))
+        return lines
 
-    def render_climate_panel(self):
+    def render_climate_panel(self, width: int) -> List[str]:
         mid_cfg = self.cfg.get("middle", {}) or {}
         boiler_id = str(mid_cfg.get("boiler_entity", "")).strip()
         boiler_on_state = str(mid_cfg.get("boiler_on_state", "on")).strip().lower()
         boiler_state = (self.entity_states.get(boiler_id).state if boiler_id and self.entity_states.get(boiler_id) else "-").strip().lower()
         boiler_on = (boiler_state == boiler_on_state)
 
-        header = Text()
-        boiler_bar = self.build_boiler_bar()
-        if boiler_bar is not None:
-            header.append(boiler_bar)
-            header.append("\n")
-        header.append("BOILER:", style=self.color_normal)
+        lines: List[str] = []
+        boiler_bar = self.build_boiler_bar_lines()
+        if boiler_bar:
+            lines.extend(boiler_bar)
+
+        boiler_label = style_text("BOILER:", fg=self.color_normal)
         if boiler_on:
             boiler_style = self.color_on_bright if self._pulse else self.color_on
         else:
             boiler_style = self.color_normal
-        header.append("ON" if boiler_on else "OFF", style=boiler_style)
-        header.append("\n\n")
+        boiler_state_txt = style_text("ON" if boiler_on else "OFF", fg=boiler_style)
+        lines.append(boiler_label + boiler_state_txt)
+        lines.append("")
 
         unit_default = str(self.cfg["climate"].get("unit_fallback", "C")).strip()
 
-        tbl = Table.grid(expand=True, padding=(0, 0))
-        tbl.add_column(ratio=7, justify="left", overflow="crop")
-        tbl.add_column(ratio=5, justify="right", overflow="crop")
-        tbl.add_column(ratio=3, justify="right", overflow="crop")
-        tbl.add_column(ratio=3, justify="right", overflow="crop")
-
-        tbl.add_row(
-            Text("ROOM", style=self.color_normal),
-            Text("NOW", style=self.color_normal),
-            Text("SET", style=self.color_normal),
-            Text("AVG", style=self.color_normal),
-        )
-        tbl.add_row(
-            Text("─" * 18, style=self.color_normal_dim),
-            Text("─" * 13, style=self.color_normal_dim),
-            Text("─" * 8, style=self.color_normal_dim),
-            Text("─" * 8, style=self.color_normal_dim),
+        col_widths = [18, 13, 8, 8]
+        header_cells = [
+            style_text(pad_ansi("ROOM", col_widths[0]), fg=self.color_normal),
+            style_text(pad_ansi("NOW", col_widths[1]), fg=self.color_normal),
+            style_text(pad_ansi("SET", col_widths[2]), fg=self.color_normal),
+            style_text(pad_ansi("AVG", col_widths[3]), fg=self.color_normal),
+        ]
+        lines.append(" ".join(header_cells))
+        lines.append(
+            " ".join(
+                [
+                    style_text(pad_ansi("─" * col_widths[0], col_widths[0]), fg=self.color_normal_dim),
+                    style_text(pad_ansi("─" * col_widths[1], col_widths[1]), fg=self.color_normal_dim),
+                    style_text(pad_ansi("─" * col_widths[2], col_widths[2]), fg=self.color_normal_dim),
+                    style_text(pad_ansi("─" * col_widths[3], col_widths[3]), fg=self.color_normal_dim),
+                ]
+            )
         )
 
         for floor in self.cfg["climate"].get("floors", []):
-
             for room in floor.get("rooms", []):
                 name = str(room.get("name", room.get("id", ""))).strip()
                 eid = str(room.get("id", "")).strip()
@@ -1367,57 +1519,39 @@ class HatuiApp(App):
                         room_style = self.color_normal_dim
                         now_style = self.color_normal_dim
 
-                tbl.add_row(
-                    Text(name, style=room_style),
-                    Text(now_txt, style=("bold " + now_style)),
-                    Text(set_txt, style=self.color_normal_dim),
-                    Text(avg_txt, style=self.color_normal_dim),
-                )
+                row_cells = [
+                    style_text(pad_ansi(name, col_widths[0]), fg=room_style),
+                    style_text(pad_ansi(now_txt, col_widths[1]), fg=now_style, bold=True),
+                    style_text(pad_ansi(set_txt, col_widths[2]), fg=self.color_normal_dim),
+                    style_text(pad_ansi(avg_txt, col_widths[3]), fg=self.color_normal_dim),
+                ]
+                lines.append(" ".join(row_cells))
+        return lines
 
-        outer = Table.grid(expand=True)
-        outer.add_column()
-        outer.add_row(header)
-        outer.add_row(tbl)
-        return outer
-
-    def build_boiler_bar(self) -> Optional[Text]:
+    def build_boiler_bar_lines(self) -> List[str]:
         if not self.boiler_bar_fracs or not self.boiler_bar_label or not self.boiler_bar_tick:
-            return None
+            return []
 
-        # Period coloring rules:
-        # - off whole period => normal_dim
-        # - on part => normal
-        # - on whole => on
         full_thr = 0.98
         part_thr = 0.02
 
-        # How recently was it ON?
         now = datetime.now(timezone.utc)
         if self.boiler_last_on_end is None:
             age_sec = 10**9
         else:
             age_sec = (now - self.boiler_last_on_end).total_seconds()
 
-        # Final (most recent) period special behavior:
-        # - if ON now => on_bright blinking
-        # - else if ON within last 5m => on
-        # - else if ON within last 15m => normal
-        # - else => normal_dim
-        bar = Text()
-        bar.append(Text(self.boiler_bar_label, style=self.color_normal_dim, no_wrap=True, overflow="crop"))
-        bar.append("\n")
-        bar.append(Text(self.boiler_bar_tick, style=self.color_normal_dim, no_wrap=True, overflow="crop"))
-        bar.append("\n")
+        lines = []
+        lines.append(style_text(self.boiler_bar_label, fg=self.color_normal_dim))
+        lines.append(style_text(self.boiler_bar_tick, fg=self.color_normal_dim))
 
-        # --- Density glyph mapping (no gaps) ---
+        bar_parts: List[str] = []
         for i, frac in enumerate(self.boiler_bar_fracs):
-            # Base style (keep your colour rules)
             if frac >= full_thr:
                 st = self.color_on
                 ch = "█"
             elif frac > part_thr:
                 st = self.color_normal
-                # 0..1 mapped to density
                 if frac < 0.50:
                     ch = "▒"
                 else:
@@ -1426,7 +1560,6 @@ class HatuiApp(App):
                 st = self.color_normal_dim
                 ch = "░"
 
-            # Final (most recent) period special behaviour
             if i == (len(self.boiler_bar_fracs) - 1):
                 if self.boiler_on_live:
                     st = self.color_on_bright if self._pulse else self.color_on
@@ -1442,9 +1575,10 @@ class HatuiApp(App):
                         st = self.color_normal_dim
                         ch = "░"
 
-            bar.append(ch, style=st)
+            bar_parts.append(style_text(ch, fg=st))
 
-        return bar
+        lines.append("".join(bar_parts))
+        return lines
 
 
 def main() -> int:
@@ -1467,7 +1601,7 @@ def main() -> int:
         return 2
 
     try:
-        HatuiApp(ha_url=ha_url, ha_token=ha_token, cfg_path=cfg_path).run()
+        asyncio.run(HatuiAnsiApp(ha_url=ha_url, ha_token=ha_token, cfg_path=cfg_path).run())
         return 0
     except KeyboardInterrupt:
         return 0

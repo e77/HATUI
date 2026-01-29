@@ -1,7 +1,7 @@
 HATUI v9.5.0 (build 2026-01-27) — stable drop
 
 Key points:
-- Textual 0.76.0 compatible.
+- ANSI/terminal rendering only (no UI frameworks).
 - Left panel climate table columns: ROOM | NOW | SET | AVG
 - SET (target) is optional per-room:
     set_entity: <entity_id>
