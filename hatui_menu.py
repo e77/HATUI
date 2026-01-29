@@ -67,12 +67,11 @@ def git_status() -> None:
 
 
 def git_check_updates() -> List[str]:
-    run(["git", "fetch", "--all", "--prune"])
-    upstream = run(["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-    if upstream.returncode != 0:
-        print("No upstream configured for this branch.")
+    fetch = run(["git", "fetch", "origin", "master", "--prune"])
+    if fetch.returncode != 0:
+        print(fetch.stdout or fetch.stderr)
         return []
-    upstream_ref = upstream.stdout.strip()
+    upstream_ref = "origin/master"
     diff = run(["git", "diff", "--name-only", "HEAD.."+upstream_ref])
     files = [f for f in diff.stdout.splitlines() if f.strip()]
     print("\n[updates available]" if files else "\n[up to date]")
@@ -82,10 +81,18 @@ def git_check_updates() -> List[str]:
 
 
 def git_apply_updates() -> bool:
-    print("\n[pulling updates]")
-    res = run(["git", "pull", "--ff-only"])
-    print(res.stdout or res.stderr)
-    return res.returncode == 0
+    print("\n[applying firmware-style update]")
+    fetch = run(["git", "fetch", "origin", "master", "--prune"])
+    if fetch.returncode != 0:
+        print(fetch.stdout or fetch.stderr)
+        return False
+    reset = run(["git", "reset", "--hard", "origin/master"])
+    print(reset.stdout or reset.stderr)
+    if reset.returncode != 0:
+        return False
+    clean = run(["git", "clean", "-fd"])
+    print(clean.stdout or clean.stderr)
+    return clean.returncode == 0
 
 
 def service_exists_or_active(unit: str) -> bool:
@@ -152,7 +159,7 @@ def show_menu() -> None:
     print("\nHATUI SSH MENU")
     print("1) Show git status")
     print("2) Check for updates (git fetch)")
-    print("3) Apply YAML/PY updates (fast-forward)")
+    print("3) Apply YAML/PY updates (force master)")
     print("4) Trigger scenario (fixtures)")
     print("5) Flash mode (auto/on/off)")
     print("6) Clear overrides")
