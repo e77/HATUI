@@ -46,8 +46,8 @@ WantedBy=multi-user.target
 ```
 
 The menu writes commands to the control FIFO (`$HATUI_CTL`, default `/run/hatui/ctl`) and supports
-firmware-style updates for YAML/PY files by force-syncing the local checkout to `origin/master`.
-This update path discards local changes (`git reset --hard` + `git clean -fd`).
+firmware-style updates for YAML/PY files by force-syncing the local checkout to the `origin` default
+branch. This update path discards local changes (`git reset --hard` + `git clean -fd`).
 After applying updates, it restarts `hatui-wayland.service` when available; otherwise it restarts
 `hatui.service` (the default `HATUI_SERVICE`).
 Restarting from the menu requires passwordless sudo for `systemctl restart`. Add a sudoers rule

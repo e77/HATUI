@@ -66,13 +66,29 @@ def git_status() -> None:
     print(res.stdout or res.stderr)
 
 
+def git_default_remote_ref() -> str | None:
+    head_ref = run(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+    if head_ref.returncode == 0:
+        ref = head_ref.stdout.strip()
+        if ref:
+            return ref
+    for candidate in ("origin/master", "origin/main"):
+        probe = run(["git", "show-ref", "--verify", "--quiet", f"refs/remotes/{candidate}"])
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
 def git_check_updates() -> List[str]:
-    fetch = run(["git", "fetch", "origin", "master", "--prune"])
+    fetch = run(["git", "fetch", "origin", "--prune"])
     if fetch.returncode != 0:
         print(fetch.stdout or fetch.stderr)
         return []
-    upstream_ref = "origin/master"
-    diff = run(["git", "diff", "--name-only", "HEAD.."+upstream_ref])
+    upstream_ref = git_default_remote_ref()
+    if not upstream_ref:
+        print("No default branch found on origin (expected origin/HEAD).")
+        return []
+    diff = run(["git", "diff", "--name-only", f"HEAD..{upstream_ref}"])
     files = [f for f in diff.stdout.splitlines() if f.strip()]
     print("\n[updates available]" if files else "\n[up to date]")
     for f in files:
@@ -82,11 +98,15 @@ def git_check_updates() -> List[str]:
 
 def git_apply_updates() -> bool:
     print("\n[applying firmware-style update]")
-    fetch = run(["git", "fetch", "origin", "master", "--prune"])
+    fetch = run(["git", "fetch", "origin", "--prune"])
     if fetch.returncode != 0:
         print(fetch.stdout or fetch.stderr)
         return False
-    reset = run(["git", "reset", "--hard", "origin/master"])
+    upstream_ref = git_default_remote_ref()
+    if not upstream_ref:
+        print("No default branch found on origin (expected origin/HEAD).")
+        return False
+    reset = run(["git", "reset", "--hard", upstream_ref])
     print(reset.stdout or reset.stderr)
     if reset.returncode != 0:
         return False
@@ -159,7 +179,7 @@ def show_menu() -> None:
     print("\nHATUI SSH MENU")
     print("1) Show git status")
     print("2) Check for updates (git fetch)")
-    print("3) Apply YAML/PY updates (force master)")
+    print("3) Apply YAML/PY updates (force origin default)")
     print("4) Trigger scenario (fixtures)")
     print("5) Flash mode (auto/on/off)")
     print("6) Clear overrides")
