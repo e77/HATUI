@@ -27,6 +27,24 @@ User=pi
 WantedBy=multi-user.target
 ```
 
+Example systemd unit for the main TUI (with dependency preflight):
+
+```
+[Unit]
+Description=HATUI TUI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hatui
+ExecStart=/opt/hatui/scripts/hatui-launch.sh
+Restart=on-failure
+User=pi
+
+[Install]
+WantedBy=multi-user.target
+```
+
 The menu writes commands to the control FIFO (`$HATUI_CTL`, default `/run/hatui/ctl`) and supports
 fast-forward `git pull` updates for YAML/PY files.
 After applying updates, it restarts `hatui-wayland.service` when available; otherwise it restarts
