@@ -22,6 +22,7 @@ import yaml
 CTL_PATH = os.getenv("HATUI_CTL", "/run/hatui/ctl")
 FIXTURE_PATH = os.getenv("HATUI_FIXTURE", "fixtures.yaml").strip()
 HATUI_SERVICE = os.getenv("HATUI_SERVICE", "hatui.service").strip()
+WAYLAND_SERVICE = "hatui-wayland.service"
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -86,15 +87,33 @@ def git_apply_updates() -> bool:
     return res.returncode == 0
 
 
-def restart_service() -> bool:
-    if not HATUI_SERVICE:
-        print("No service configured to restart.")
+def service_exists_or_active(unit: str) -> bool:
+    if not unit:
         return False
-    print(f"\n[restarting service] {HATUI_SERVICE}")
-    res = run(["systemctl", "restart", HATUI_SERVICE])
+    res = run(["systemctl", "status", "--no-pager", unit])
+    return res.returncode in (0, 3)
+
+
+def detect_service_unit() -> str | None:
+    if service_exists_or_active(WAYLAND_SERVICE):
+        return WAYLAND_SERVICE
+    if service_exists_or_active(HATUI_SERVICE):
+        return HATUI_SERVICE
+    return None
+
+
+def restart_service() -> bool:
+    unit = detect_service_unit()
+    if not unit:
+        print("No service unit found to restart.")
+        return False
+    print(f"\n[restarting service] {unit}")
+    res = run(["sudo", "-n", "systemctl", "restart", unit])
     print(res.stdout or res.stderr)
     if res.returncode != 0:
         print("Service restart failed.")
+        print("Add this sudoers rule to allow non-interactive restart:")
+        print(f"  echo77it ALL=NOPASSWD: /bin/systemctl restart {unit}")
         return False
     print("Service restarted.")
     return True
