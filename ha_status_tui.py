@@ -486,7 +486,7 @@ class HatuiApp(App):
 
         self.set_interval(self.poll_seconds, self.poll_fast)
         self.set_interval(0.2, self.heartbeat)
-        self.set_interval(0.5, self.toggle_flash_and_pulse)
+        self.set_interval(1.0, self.toggle_flash_and_pulse)
         self.set_interval(self.history_refresh_seconds, self.poll_history)
 
         await self.poll_fast()
