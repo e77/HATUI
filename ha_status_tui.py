@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import stat
 import asyncio
 import threading
@@ -132,6 +133,48 @@ def parse_iso(ts: str) -> Optional[datetime]:
         return None
 
 
+def build_bool_bar(
+    history: List[Dict[str, Any]],
+    now_utc: datetime,
+    window_hours: float,
+    blocks: int,
+    predicate,
+) -> List[bool]:
+    start = now_utc - timedelta(hours=window_hours)
+    events: List[Tuple[datetime, bool]] = []
+
+    for row in history or []:
+        ts = parse_iso(str(row.get("last_changed") or row.get("last_updated") or ""))
+        if ts is None:
+            continue
+        events.append((ts, bool(predicate(row.get("state")))))
+
+    events.sort(key=lambda t: t[0])
+
+    current = False
+    for ts, is_on in events:
+        if ts <= start:
+            current = is_on
+        else:
+            break
+
+    out: List[bool] = []
+    block_seconds = (window_hours * 3600) / max(1, int(blocks))
+    eidx = 0
+    window_start = start
+
+    for b in range(int(blocks)):
+        window_end = start + timedelta(seconds=(b + 1) * block_seconds)
+        while eidx < len(events) and events[eidx][0] < window_end:
+            if events[eidx][0] >= window_start:
+                current = events[eidx][1]
+            eidx += 1
+        out.append(current)
+        window_start = window_end
+
+    return out
+
+
 def build_state_bar_24h(
     history: List[Dict[str, Any]],
     now_utc: datetime,
@@ -174,6 +217,17 @@ def build_state_bar_24h(
         window_start = window_end
 
     return out
+
+
+def parse_active_when(expr: str) -> Tuple[str, Optional[str], Optional[float]]:
+    expr = str(expr or "").strip()
+    if not expr:
+        return "", None, None
+    m = re.match(r"^(\S+)\s*(>=|<=|==|!=|>|<|=)\s*([0-9.]+)$", expr)
+    if m:
+        entity_id, op, value = m.groups()
+        return entity_id.strip(), ("==" if op == "=" else op), safe_float(value)
+    return expr, None, None
 
 
 def compute_period_fractions(
@@ -455,6 +509,7 @@ class HatuiApp(App):
 
         self.runtime_overrides: Dict[str, EntityState] = {}
         self.flash_mode = "auto"  # auto|on|off
+        self.right_panel_history: Dict[str, List[Dict[str, Any]]] = {}
 
         self.fixtures: Optional[FixtureEngine] = None
         if FIXTURE_PATH and os.path.exists(FIXTURE_PATH):
@@ -628,6 +683,60 @@ class HatuiApp(App):
             parts.append(f"{label}:{txt}" if label else str(txt))
         return "  ".join(parts)
 
+    def right_panel_blocks(self) -> List[Dict[str, Any]]:
+        rp = self.cfg.get("right_panel", {}) or {}
+        return list(rp.get("blocks", []) or [])
+
+    def right_panel_label_width(self) -> int:
+        rp = self.cfg.get("right_panel", {}) or {}
+        return int(rp.get("label_width", 12))
+
+    def right_panel_bar_width(self) -> int:
+        rp = self.cfg.get("right_panel", {}) or {}
+        return int(rp.get("bar_width", 24))
+
+    def right_panel_timeline_width(self) -> int:
+        rp = self.cfg.get("right_panel", {}) or {}
+        return int(rp.get("timeline_width", 32))
+
+    def collect_right_panel_entities(self) -> List[str]:
+        entity_ids: List[str] = []
+        for block in self.right_panel_blocks():
+            btype = str(block.get("type", "")).strip().lower()
+            if btype == "value_row":
+                for key in ("left", "right"):
+                    info = block.get(key, {}) or {}
+                    entity_ids.append(str(info.get("entity", "")).strip())
+            elif btype == "ranked_list":
+                for item in block.get("items", []) or []:
+                    entity_ids.append(str(item.get("entity", "")).strip())
+            elif btype == "stacked_bar":
+                entity_ids.append(str(block.get("total_entity", "")).strip())
+                for seg in block.get("segments", []) or []:
+                    entity_ids.append(str(seg.get("entity", "")).strip())
+            elif btype == "timeline_onoff":
+                for item in block.get("items", []) or []:
+                    entity, _, _ = parse_active_when(item.get("active_when", ""))
+                    entity_ids.append(str(entity).strip())
+        return [eid for eid in entity_ids if eid]
+
+    def collect_right_panel_history_entities(self) -> Dict[str, float]:
+        entity_windows: Dict[str, float] = {}
+        for block in self.right_panel_blocks():
+            btype = str(block.get("type", "")).strip().lower()
+            if btype != "timeline_onoff":
+                continue
+            window_hours = float(block.get("window_hours", 24))
+            for item in block.get("items", []) or []:
+                entity, _, _ = parse_active_when(item.get("active_when", ""))
+                entity = str(entity).strip()
+                if not entity:
+                    continue
+                prev = entity_windows.get(entity, 0.0)
+                if window_hours > prev:
+                    entity_windows[entity] = window_hours
+        return entity_windows
+
     def grid_lr(self, left: str, right: str):
         tbl = Table.grid(expand=True)
         tbl.add_column(ratio=3, justify="left", overflow="crop")
@@ -706,6 +815,8 @@ class HatuiApp(App):
                     set_eid = str(room.get("set_entity", "")).strip()
                     if set_eid:
                         entity_ids.append(set_eid)
+
+            entity_ids.extend(self.collect_right_panel_entities())
 
             entity_ids.extend(list(self.runtime_overrides.keys()))
 
@@ -824,6 +935,19 @@ class HatuiApp(App):
                     vals = [v for v in vals2 if v is not None]
                     self.climate_avg[eid] = (sum(vals) / len(vals)) if vals else None
 
+            self.right_panel_history.clear()
+            entity_windows = self.collect_right_panel_history_entities()
+            for entity_id, window_hours in entity_windows.items():
+                try:
+                    hist = await self.ha.get_history(
+                        self._session,
+                        entity_id,
+                        now - timedelta(hours=window_hours),
+                    )
+                    self.right_panel_history[entity_id] = hist
+                except Exception as e:
+                    log(f"right_panel history error for {entity_id}: {e}")
+
             self.render_panels()
 
         except Exception as e:
@@ -848,14 +972,312 @@ class HatuiApp(App):
         t.append("  flash auto|on|off\n", style=self.color_normal_dim)
         return t
 
-    def render_right_panel(self):
+    def get_entity_state_value(self, entity_id: str) -> Tuple[str, Optional[float], Dict[str, Any]]:
+        entity_id = str(entity_id or "").strip()
+        st = self.entity_states.get(entity_id)
+        state_str = st.state if st else ""
+        attrs = st.attributes if st else {}
+        value = safe_float(state_str) if state_str else None
+        return state_str, value, attrs
+
+    def format_entity_value(
+        self,
+        fmt: str,
+        state_str: str,
+        value: Optional[float],
+        attrs: Dict[str, Any],
+    ) -> str:
+        fmt = str(fmt or "{state}")
+        if value is None:
+            if "{state" in fmt:
+                try:
+                    return fmt.format(state=state_str, **attrs)
+                except Exception:
+                    return state_str or "—"
+            return "—"
+        try:
+            return fmt.format(value=value, state=state_str, **attrs)
+        except Exception:
+            return state_str or "—"
+
+    def render_value_cell(self, cfg: Dict[str, Any]) -> Text:
+        label = str(cfg.get("label", "")).strip()
+        entity_id = str(cfg.get("entity", "")).strip()
+        fmt = str(cfg.get("fmt", "{value}"))
+        state_str, value, attrs = self.get_entity_state_value(entity_id)
+        value_text = self.format_entity_value(fmt, state_str, value, attrs)
         t = Text()
-        t.append("ENERGY\n\n", style=self.color_normal)
-        t.append("v10: energy/power panel next.\n", style=self.color_normal_dim)
-        if self.fixtures:
-            t.append("\nSCENARIOS: ", style=self.color_normal_dim)
-            t.append(", ".join(self.fixtures.scenario_names()), style=self.color_normal_dim)
+        if label:
+            t.append(label + " ", style=self.color_normal_dim)
+        t.append(value_text, style=self.color_normal)
         return t
+
+    def render_value_row(self, block: Dict[str, Any]):
+        left_cfg = block.get("left", {}) or {}
+        right_cfg = block.get("right", {}) or {}
+        tbl = Table.grid(expand=True, padding=(0, 0))
+        tbl.add_column(ratio=1, justify="left", overflow="crop")
+        tbl.add_column(ratio=1, justify="right", overflow="crop")
+        tbl.add_row(self.render_value_cell(left_cfg), self.render_value_cell(right_cfg))
+        return tbl
+
+    def render_ranked_list(self, block: Dict[str, Any]):
+        title = str(block.get("title", "")).strip()
+        limit = int(block.get("limit", 5))
+        value_fmt = str(block.get("value_fmt", "{value:,.0f} W"))
+        thresholds = block.get("thresholds", {}) or {}
+        red_thr = safe_float(thresholds.get("red"))
+        yellow_thr = safe_float(thresholds.get("yellow"))
+
+        rows: List[Tuple[str, Optional[float]]] = []
+        for item in block.get("items", []) or []:
+            name = str(item.get("name", item.get("entity", ""))).strip()
+            entity_id = str(item.get("entity", "")).strip()
+            state_str, value, _ = self.get_entity_state_value(entity_id)
+            if value is None:
+                value = safe_float(state_str)
+            rows.append((name, value))
+
+        rows.sort(key=lambda r: (r[1] is None, -(r[1] or 0.0)))
+        rows = rows[:max(0, limit)]
+
+        outer = Table.grid(expand=True)
+        outer.add_column()
+        if title:
+            outer.add_row(Text(title, style=self.color_normal))
+
+        tbl = Table.grid(expand=True, padding=(0, 0))
+        tbl.add_column(width=self.right_panel_label_width(), justify="left", overflow="crop")
+        tbl.add_column(justify="right", overflow="crop")
+
+        for name, value in rows:
+            if value is None:
+                value_text = "—"
+                value_style = self.color_normal_dim
+            else:
+                try:
+                    value_text = value_fmt.format(value=value)
+                except Exception:
+                    value_text = f"{value}"
+                if red_thr is not None and value >= red_thr:
+                    value_style = self.color_warn_a
+                elif yellow_thr is not None and value >= yellow_thr:
+                    value_style = self.color_warn_b
+                else:
+                    value_style = self.color_normal
+
+            tbl.add_row(
+                Text(name, style=self.color_normal),
+                Text(value_text, style=value_style),
+            )
+
+        outer.add_row(tbl)
+        return outer
+
+    def render_stacked_bar(self, block: Dict[str, Any]):
+        title = str(block.get("title", "")).strip()
+        total_entity = str(block.get("total_entity", "")).strip()
+        total_fmt = str(block.get("total_fmt", "{value:,.0f} W"))
+        max_w = safe_float(block.get("max_w"))
+
+        total_state, total_value, total_attrs = self.get_entity_state_value(total_entity)
+
+        segments_cfg = block.get("segments", []) or []
+        segments: List[Tuple[str, float, Optional[float]]] = []
+        for seg in segments_cfg:
+            name = str(seg.get("name", seg.get("entity", ""))).strip()
+            entity_id = str(seg.get("entity", "")).strip()
+            state_str, value, _ = self.get_entity_state_value(entity_id)
+            if value is None:
+                value = safe_float(state_str)
+            segments.append((name, value or 0.0, value))
+
+        seg_sum = sum(v for _, v, _ in segments)
+        if total_value is None:
+            total_value = seg_sum
+
+        other_cfg = block.get("other", {}) or {}
+        if str(other_cfg.get("mode", "")).strip().lower() == "remainder":
+            remainder = max(0.0, (total_value or 0.0) - seg_sum)
+            if remainder > 0:
+                segments.append((str(other_cfg.get("name", "Other")), remainder, remainder))
+
+        denom = max_w if max_w and max_w > 0 else (total_value or 0.0)
+        width = max(4, self.right_panel_bar_width())
+        total_width = 0
+        if denom > 0 and total_value:
+            total_width = min(width, int(round((total_value / denom) * width)))
+        total_width = max(0, total_width)
+
+        seg_widths = [0 for _ in segments]
+        if total_width > 0 and total_value and total_value > 0:
+            for i, (_, v, _) in enumerate(segments):
+                seg_widths[i] = int(round((v / total_value) * total_width))
+            while sum(seg_widths) > total_width:
+                idx = max(range(len(seg_widths)), key=lambda i: seg_widths[i])
+                if seg_widths[idx] > 0:
+                    seg_widths[idx] -= 1
+                else:
+                    break
+            while sum(seg_widths) < total_width:
+                idx = max(range(len(seg_widths)), key=lambda i: segments[i][1])
+                seg_widths[idx] += 1
+
+        palette = [
+            self.color_on,
+            self.color_normal,
+            self.color_normal_dim,
+            self.color_warn_b,
+            self.color_warn_a,
+        ]
+
+        bar = Text()
+        for i, width_i in enumerate(seg_widths):
+            if width_i <= 0:
+                continue
+            color = palette[i % len(palette)]
+            bar.append("█" * width_i, style=color)
+        if total_width < width:
+            bar.append("·" * (width - total_width), style=self.color_normal_dim)
+
+        outer = Table.grid(expand=True)
+        outer.add_column()
+        if title or total_entity:
+            total_text = self.format_entity_value(total_fmt, total_state, total_value, total_attrs)
+            outer.add_row(self.grid_lr(title or "Distribution", total_text))
+
+        outer.add_row(bar)
+
+        if block.get("show_legend", True):
+            legend = Table.grid(expand=True, padding=(0, 0))
+            legend.add_column(width=self.right_panel_label_width(), justify="left", overflow="crop")
+            legend.add_column(justify="right", overflow="crop")
+            for i, (name, _, raw_value) in enumerate(segments):
+                color = palette[i % len(palette)]
+                if raw_value is None:
+                    val_text = "—"
+                else:
+                    val_text = self.format_entity_value(total_fmt, str(raw_value), raw_value, {})
+                legend.add_row(Text(name, style=color), Text(val_text, style=color))
+            if segments:
+                outer.add_row(legend)
+
+        return outer
+
+    def compress_bool_blocks(self, blocks: List[bool], target_len: int) -> List[bool]:
+        if target_len <= 0:
+            return []
+        if len(blocks) <= target_len:
+            return blocks
+        out: List[bool] = []
+        step = len(blocks) / float(target_len)
+        for i in range(target_len):
+            start = int(i * step)
+            end = int((i + 1) * step)
+            if end <= start:
+                end = start + 1
+            chunk = blocks[start:end]
+            out.append(any(chunk))
+        return out
+
+    def render_timeline_onoff(self, block: Dict[str, Any]):
+        title = str(block.get("title", "")).strip()
+        window_hours = float(block.get("window_hours", 24))
+        resolution = int(block.get("resolution", 96))
+        width = min(resolution, self.right_panel_timeline_width())
+        now = datetime.now(timezone.utc)
+
+        outer = Table.grid(expand=True)
+        outer.add_column()
+        if title:
+            outer.add_row(Text(title, style=self.color_normal))
+
+        tbl = Table.grid(expand=True, padding=(0, 0))
+        tbl.add_column(width=self.right_panel_label_width(), justify="left", overflow="crop")
+        tbl.add_column(justify="left", overflow="crop")
+
+        for item in block.get("items", []) or []:
+            name = str(item.get("name", "")).strip()
+            entity, op, threshold = parse_active_when(item.get("active_when", ""))
+            entity = str(entity).strip()
+            history = self.right_panel_history.get(entity, []) if entity else []
+
+            if op and threshold is not None:
+                def predicate(state):
+                    val = safe_float(state)
+                    if val is None:
+                        return False
+                    if op == ">":
+                        return val > threshold
+                    if op == ">=":
+                        return val >= threshold
+                    if op == "<":
+                        return val < threshold
+                    if op == "<=":
+                        return val <= threshold
+                    if op == "==":
+                        return val == threshold
+                    if op == "!=":
+                        return val != threshold
+                    return False
+            else:
+                on_states = item.get("on_states", ["on", "true", "home", "open"]) or []
+                on_set = set([str(s).strip().lower() for s in on_states])
+
+                def predicate(state):
+                    return str(state or "").strip().lower() in on_set
+
+            blocks = build_bool_bar(history, now, window_hours, resolution, predicate)
+            blocks = self.compress_bool_blocks(blocks, width)
+
+            bar = Text()
+            for is_on in blocks:
+                if is_on:
+                    bar.append("█", style=self.color_on)
+                else:
+                    bar.append("·", style=self.color_normal_dim)
+
+            if not blocks:
+                bar.append("—", style=self.color_normal_dim)
+
+            tbl.add_row(Text(name or entity, style=self.color_normal), bar)
+
+        outer.add_row(tbl)
+        return outer
+
+    def render_divider(self) -> Text:
+        width = self.right_panel_label_width() + self.right_panel_bar_width() + 3
+        return Text("─" * max(8, width), style=self.color_normal_dim)
+
+    def render_right_panel(self):
+        rp = self.cfg.get("right_panel", {}) or {}
+        title = str(rp.get("title", "ENERGY")).strip()
+
+        outer = Table.grid(expand=True)
+        outer.add_column()
+        outer.add_row(Text(title + "\n", style=self.color_normal))
+
+        blocks = self.right_panel_blocks()
+        if not blocks:
+            t = Text("No right_panel blocks configured.\n", style=self.color_normal_dim)
+            outer.add_row(t)
+            return outer
+
+        for block in blocks:
+            btype = str(block.get("type", "")).strip().lower()
+            if btype == "value_row":
+                outer.add_row(self.render_value_row(block))
+            elif btype == "ranked_list":
+                outer.add_row(self.render_ranked_list(block))
+            elif btype == "stacked_bar":
+                outer.add_row(self.render_stacked_bar(block))
+            elif btype == "timeline_onoff":
+                outer.add_row(self.render_timeline_onoff(block))
+            elif btype == "divider":
+                outer.add_row(self.render_divider())
+            else:
+                outer.add_row(Text(f"Unknown block: {btype}", style=self.color_normal_dim))
+        return outer
 
     def render_climate_panel(self):
         mid_cfg = self.cfg.get("middle", {}) or {}

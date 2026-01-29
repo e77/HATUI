@@ -1,0 +1,51 @@
+right_panel:
+  title: "Power Map"
+  label_width: 12
+  bar_width: 24
+  timeline_width: 32
+  blocks:
+    - type: value_row
+      left:  { label: "⚡ Grid", entity: "sensor.electricity_import_power", fmt: "{value:,.0f} W" }
+      right: { label: "🔥 Gas",  entity: "sensor.gas_power",              fmt: "{value:.2f} kW" }
+
+    - type: divider
+
+    - type: ranked_list
+      title: "Top consumers"
+      limit: 8
+      value_fmt: "{value:,.0f} W"
+      thresholds:
+        red: 2000
+        yellow: 800
+      items:
+        - { name: "Oven/Hob",        entity: "sensor.power_oven" }
+        - { name: "Kettle",          entity: "sensor.power_kettle" }
+        - { name: "Dishwasher",      entity: "sensor.power_dishwasher" }
+        - { name: "Washer",          entity: "sensor.power_washer" }
+        - { name: "Dryer",           entity: "sensor.power_dryer" }
+        - { name: "Office/IT",       entity: "sensor.power_it_rack" }
+        - { name: "Lighting",        entity: "sensor.power_lighting" }
+        - { name: "Fridge/Freezer",  entity: "sensor.power_fridge" }
+
+    - type: divider
+
+    - type: stacked_bar
+      title: "Distribution"
+      total_entity: "sensor.electricity_import_power"
+      max_w: 7000
+      segments:
+        - { name: "Kitchen",  entity: "sensor.power_kitchen" }
+        - { name: "Laundry",  entity: "sensor.power_laundry" }
+        - { name: "IT",       entity: "sensor.power_it_rack" }
+        - { name: "Lights",   entity: "sensor.power_lighting" }
+      other:
+        mode: "remainder"
+
+    - type: timeline_onoff
+      title: "Last 24h activity"
+      window_hours: 24
+      resolution: 96
+      items:
+        - { name: "Oven",    active_when: "sensor.power_oven > 300" }
+        - { name: "Kettle",  active_when: "sensor.power_kettle > 300" }
+        - { name: "CH (gas)", active_when: "sensor.gas_power > 0.2" }
